@@ -84,8 +84,21 @@ class Go2DeviceBundle:
         if plugins_cfg.get("loco", {}).get("enabled", False):
             from device import LocoStatePlugin, LocoPlugin
             self._plugins.append(LocoStatePlugin(plugins_cfg["loco"], namespace, executor))
-            self._plugins.append(LocoPlugin(plugins_cfg["loco"], namespace, executor, rpc_proxy))
+            loco_plugin = LocoPlugin(plugins_cfg["loco"], namespace, executor, rpc_proxy)
+            self._plugins.append(loco_plugin)
             print("[bundle] LocoStatePlugin + LocoPlugin loaded")
+
+            from interview_demo import InterviewDemoPlugin
+            self._plugins.append(
+            InterviewDemoPlugin(
+                 {},
+                 namespace,
+                 executor,
+                 loco_plugin=loco_plugin,
+                 rpc_proxy=rpc_proxy
+             )
+        )
+            print("[bundle] InterviewDemoPlugin loaded")
 
         if plugins_cfg.get("obstacles_avoid", {}).get("enabled", False):
             from device import ObstaclesAvoidPlugin

@@ -364,7 +364,9 @@ class RpcProxy:
 
     def Audio_PlayStop(self, app_name: str):
         return self._call_code("audio", "PlayStop", app_name)
-
+    
+    def Audio_TtsMaker(self, text: str, speaker_id: int):
+        return self._call_code("audio", "TtsMaker", text, speaker_id)
     # ── AudioHub interface (megaphone) ────────────────────────────────────────
 
     def AudioHub_Send(self, api_id: int, param):
