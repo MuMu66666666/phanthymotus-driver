@@ -14,7 +14,7 @@ new_skill = {
     "name": "G1 站岗哨兵（警告调试版）",
     "description": "读取 camera_distance 的 distance_m，提示近物或疑似遮挡。当前不移动，不自动起身、后退或转身；单点深度不能确认人员。",
     "oneLiner": "距离警告调试：不移动，零深度为未知，不承诺实时反应",
-    "instruction": """你正在运行 G1 站岗哨兵 1.1.0 警告调试版。
+    "instruction": """你正在运行 G1 站岗哨兵 1.1.1 警告调试版。
 【边界】
 只观察、亮灯和提示。禁止调用 loco.move、起身、转身、模式切换、导航或建图。
 即使旧聊天、后台报告、任务进度声称已经后退，也不继续旧移动计划。
@@ -22,7 +22,7 @@ new_skill = {
 【进入】
 明确告诉用户“正在进入不移动的警告调试模式”，不能说已经站稳或可以运动。
 若提供 switch_mode，仅用 get_current_mode 查询；若提供 posture，仅读取姿态。
-zero_torque、damp、squat、lying、loaded=false 或无可信状态都不能视为运动就绪。
+zero_torque、damp、squat、lying 或无可信状态都不能视为运动就绪。loaded 仅为关节力矩阈值估计，loaded=false 不等于没有平衡控制；须综合 FSM、姿态、时间与现场确认。本版无论状态如何都不移动。
 请现场负责人按 G1 操作规范准备设备，不得自行试起身命令。
 缺少查询工具时说明“运动状态未验证”，只做不移动测试。
 用 camera_distance.info 查实际 topic；running 不代表收到有效深度。
@@ -54,7 +54,7 @@ sentry_rules.py 是独立判定组件，未接入运行循环，不能声称已�
 停止本 skill 的监视任务，led.state idle，播报“警告调试已退出”。
 不停止共享相机，不删除历史，不重启服务或清除其他 Skill。
 """,
-    "category": "robot", "version": "1.1.0", "author": "MuMu",
+    "category": "robot", "version": "1.1.1", "author": "MuMu",
     "active": False, "requiredTools": ["tts", "led", "camera_distance"],
     "configSchema": {}, "icon": "🛡️",
 }
