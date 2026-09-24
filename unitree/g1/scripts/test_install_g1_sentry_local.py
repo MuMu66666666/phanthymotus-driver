@@ -40,7 +40,7 @@ class InstallerTests(unittest.TestCase):
     def test_missing_key_is_created_disabled(self):
         result = install(self.db)
         self.assertFalse(result['active'])
-        self.assertEqual(self.read()['installed'][0]['version'], '1.1.1')
+        self.assertEqual(self.read()['installed'][0]['version'], '1.2.0')
         self.assertTrue(Path(result['backup']).is_file())
 
     def test_reinstall_preserves_other_data_and_disabled_state(self):
@@ -89,8 +89,8 @@ class InstallerTests(unittest.TestCase):
         with db_connect(self.db) as conn:
             self.assertEqual(conn.execute("SELECT value FROM config WHERE key='skills'").fetchone()[0], 'not-json')
 
-    def test_required_tools_exclude_motion(self):
-        self.assertEqual(set(new_skill['requiredTools']), {'led','tts','camera_distance'})
+    def test_required_tools_only_guarded_controller(self):
+        self.assertEqual(set(new_skill['requiredTools']), {'g1_sentry'})
 
 class RulesTests(unittest.TestCase):
     def setUp(self):
