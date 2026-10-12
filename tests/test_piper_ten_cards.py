@@ -43,7 +43,7 @@ class Driver(BaseDriver):
         self.arm = SDK()
 
 
-class TenCardTests(unittest.TestCase):
+class ElevenCardTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -66,13 +66,43 @@ class TenCardTests(unittest.TestCase):
         with patch('agilex.piper.arm.time.sleep'), patch('agilex.piper.arm.time.monotonic', side_effect=clock):
             return func()
 
-    def test_exactly_ten_public_cards_and_start_never_connects(self):
+    def test_exactly_eleven_public_cards_and_start_never_connects(self):
         self.assertEqual({t['name'] for t in self.plugin.get_tools()}, set(TITLES))
         for name in TITLES:
+            if name == 'piper_trajectory':
+                continue
             self.bundle.dispatch(name, {'action': 'start'})
             self.assertIsNone(self.plugin.driver)
         self.assertIsNone(self.bundle.dispatch('piper_arm', {'action': 'prepare'}))
         self.assertIsNone(self.bundle.dispatch('piper_mode', {'action': 'switch'}))
+
+    def test_trajectory_replay_previews_then_executes_only_explicit_confirmation(self):
+        self.plugin.motion_enabled = True
+        self.plugin.trajectory_stream.phase = 'recorded'
+        self.plugin.trajectory_stream.samples = [
+            {'timestamp_ms': 1000, 'joints_deg': [1, 10, -10, 0, 20, 0]},
+            {'timestamp_ms': 1200, 'joints_deg': [1.5, 10, -10, 0, 20, 0]},
+        ]
+        plan = self.call('trajectory', 'preview', speed_deg_s=2, speed_pct=3)
+        self.assertFalse(plan['executed'])
+        self.assertEqual(plan['sample_count'], 2)
+        self.assertEqual(self.connected().calls, [])
+        result = self.fast(lambda: self.call('trajectory', 'replay', execute=True,
+                    preview_id=plan['preview_id'], workspace_clear=True, take_control=True,
+                    speed_deg_s=2, speed_pct=3))
+        self.assertTrue(result['executed'])
+        self.assertTrue(any(call[0] == 'joints' for call in self.connected().calls))
+        self.assertEqual(self.plugin.trajectory_stream.info()['state'], 'recorded')
+
+    def test_trajectory_replay_rejects_wrong_start_without_commands(self):
+        self.plugin.trajectory_stream.phase = 'recorded'
+        self.plugin.trajectory_stream.samples = [
+            {'timestamp_ms': 1000, 'joints_deg': [4, 10, -10, 0, 20, 0]},
+            {'timestamp_ms': 1200, 'joints_deg': [4.5, 10, -10, 0, 20, 0]},
+        ]
+        with self.assertRaisesRegex(RuntimeError, '录制起点'):
+            self.call('trajectory', 'preview', speed_deg_s=2, speed_pct=3)
+        self.assertEqual(self.connected().calls, [])
 
     def test_wrong_card_and_wrong_bool_reject_before_connection(self):
         for name, action, args in [('joint', 'enable', {}), ('gripper', 'disable', {}),
@@ -258,7 +288,7 @@ class TenCardTests(unittest.TestCase):
             self.assertFalse(self.plugin.motion_enabled)
             self.assertTrue(self.plugin.driver.cancelled.is_set())
 
-    def test_http_exposes_ten_and_legacy_tools_cannot_be_called(self):
+    def test_http_exposes_eleven_and_legacy_tools_cannot_be_called(self):
         server = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(lambda: self.bundle, 'test', 'test'))
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -268,7 +298,7 @@ class TenCardTests(unittest.TestCase):
                     json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': params}).encode(),
                     {'Content-Type': 'application/json'})
                 with urllib.request.urlopen(req) as response:return json.load(response)
-            self.assertEqual(len(rpc('tools/list', {})['result']['tools']), 10)
+            self.assertEqual(len(rpc('tools/list', {})['result']['tools']), 11)
             self.assertEqual(rpc('tools/call', {'name': 'piper_arm', 'arguments': {'action': 'prepare'}})['error']['code'], -32601)
             self.assertIsNone(self.plugin.driver)
         finally:

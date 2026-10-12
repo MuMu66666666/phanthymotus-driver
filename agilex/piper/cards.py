@@ -3,7 +3,8 @@ from common.vendor_runtime import action_schema, tool
 
 
 TITLES = {
-    "piper_status": "机器人状态", "piper_standby": "切换待机",
+    "piper_status": "机器人状态", "piper_trajectory": "机械臂关节轨迹记录与回放",
+    "piper_standby": "切换待机",
     "piper_can": "切换电脑控制", "piper_enable": "电机使能",
     "piper_disable": "电机失能", "piper_joint": "单轴运动",
     "piper_gripper": "夹爪开合", "piper_photo": "相机与照片",
@@ -45,14 +46,32 @@ def build_tools(topic):
             schema["x-resource"] = ["arm", "camera"] if name == "piper_photo" else "arm"
             schema["x-is-dangerous"] = name != "piper_photo"
             schema["x-hooks"] = {"on_interrupt_motion": {"action": "stop"}}
-        definition = tool(name, kind, description, schema,
-                          topic_out=[{"topic": topic, "format": "image/jpeg"}] if name == "piper_photo" else None)
+        outputs = ([{"topic": topic, "format": "image/jpeg"}] if name == "piper_photo" else
+                   [{"topic": topic.rsplit('/', 1)[0] + '/trajectory', "format": "data/json"}]
+                   if name == "piper_trajectory" else None)
+        definition = tool(name, kind, description, schema, topic_out=outputs)
         definition["title"] = TITLES[name]
         result.append(definition)
 
     add("piper_status", "模式、使能、故障分别反馈；只读取，不发送运动指令。",
         {"read": ([], "读取状态"), "firmware": ([], "查询固件"),
          "reconnect": ([], "重新连接（关闭许可并清除预览）")}, kind="resource")
+    add("piper_trajectory", "以 5 Hz 记录六轴实际反馈。先预览并逐点检查已记录轨迹，再显式确认后以低速驱动机械臂回放；另可将记录回放到数据流展示。",
+        {"record": ([], "开始记录关节反馈"),
+         "finish": ([], "结束并保留本次轨迹"),
+         "replay_data": ([], "仅将轨迹数据回放到画布数据流"),
+         "preview": (["speed_deg_s", "speed_pct"], "检查实体回放计划，不移动"),
+         "replay": (["execute", "preview_id", "workspace_clear", "take_control", "speed_deg_s", "speed_pct"], "执行已确认的低速实体回放"),
+         "clear": ([], "清除已记录轨迹")},
+        {**hidden,
+         "speed_deg_s": {"type": "number", "minimum": .5, "maximum": 2, "default": 1,
+                         "title": "回放速度（°/秒）"},
+         "speed_pct": {"type": "integer", "minimum": 1, "maximum": 5, "default": 3,
+                       "title": "SDK 速度上限（%）"}},
+        {"replay": {"preview": {"action": "preview", "execute": False},
+                    "execute": {"execute": True, **confirm_motion},
+                    "message": "机械臂将沿记录轨迹实体运动；须确认起点、现场空间和控制权。"}})
+    result[-1]["inputSchema"]["properties"]["action"]["default"] = "record"
     for name, label in [("piper_standby", "待机"), ("piper_can", "电脑控制（CAN）")]:
         props = {key: hidden[key] for key in ["execute", "preview_id"]}
         params = []

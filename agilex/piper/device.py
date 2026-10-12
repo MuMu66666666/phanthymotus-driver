@@ -1,16 +1,54 @@
-"""Ten focused cards on one shared PiPER runtime and CAN connection."""
+"""Eleven focused cards on one shared PiPER runtime and CAN connection."""
 from dataclasses import asdict
+import hashlib
+import json
 import math
 import time
 
 from agilex.piper.cards import TITLES, build_tools
 from agilex.piper.control import healthy, mode_name, ready_to_move, teaching_stopped
 from agilex.piper.runtime import PiperRuntime, confirm, number
+from agilex.piper.trajectory_stream import TrajectoryStream
 
 
 class PiperPlugin(PiperRuntime):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.trajectory_stream = TrajectoryStream(self.ros2, self.topic.rsplit('/', 1)[0] + '/trajectory',
+                                                   self.read_trajectory_sample)
+
     def get_tools(self):
         return build_tools(self.topic)
+
+    def read_trajectory_sample(self):
+        with self.connection_lock:
+            if self.closed or 'piper_trajectory' in self.stopped_cards:
+                raise RuntimeError('轨迹卡片已停止，请先启动卡片')
+            state = self.connected().get_state()
+            now = time.time()
+            if (not math.isfinite(state.feedback_time) or abs(now - state.feedback_time) > .5
+                    or len(state.joints_deg) != 6
+                    or not all(math.isfinite(v) for v in state.joints_deg)):
+                raise RuntimeError('六轴反馈无效或超过 0.5 秒未更新')
+            return {'timestamp_ms': int(now * 1000), 'feedback_time': state.feedback_time,
+                    'joints_deg': list(state.joints_deg), 'available': True, 'fresh': True}
+
+    def request_stop(self, name=None):
+        if name is None:
+            with self.trajectory_stream.lock:
+                self.trajectory_stream.stop()
+                return super().request_stop(name)
+        if name == 'piper_trajectory':
+            result = super().request_stop(name)
+            with self.trajectory_stream.lock:
+                stream_result = self.trajectory_stream.stop()
+            return {**result, 'trajectory': stream_result}
+        return super().request_stop(name)
+
+    def stop(self):
+        with self.trajectory_stream.lock:
+            self.trajectory_stream.close()
+            super().stop()
 
     def _validate(self, name, action, args):
         definition = next((t for t in self.get_tools() if t['name'] == name), None)
@@ -42,6 +80,7 @@ class PiperPlugin(PiperRuntime):
         self._validate(name, action, args)
         long_action = (name == 'piper_photo' and action in {'capture', 'import_photo'}
                        or name in {'piper_enable', 'piper_joint'} and args.get('execute') is True
+                       or name == 'piper_trajectory' and action == 'replay' and args.get('execute') is True
                        or name == 'piper_gripper' and action in {'open', 'close', 'set_width'} and args.get('execute') is True)
         if long_action and self.config.get('async_actions', True):
             previous = getattr(self.worker_context, 'operation_object', None)
@@ -57,6 +96,56 @@ class PiperPlugin(PiperRuntime):
         if name == 'piper_status':
             action = args.get('action', 'read')
         self._validate(name, action, args)
+        if name == 'piper_trajectory':
+            if action in {'start', 'stop', 'info'}:
+                if action == 'stop':
+                    return self.request_stop(name)
+                if action == 'start':
+                    self.start(name)
+                    return {'state': 'ready', 'message': '轨迹卡片已就绪；尚未开始记录或运动'}
+                return self.trajectory_stream.info()
+            if action in {'record', 'finish', 'replay_data', 'clear'}:
+                self.start(name)
+                with self.operation(name, action), self.trajectory_stream.lock:
+                    if action == 'record':
+                        return self.trajectory_stream.record()
+                    if action == 'finish':
+                        return self.trajectory_stream.finish()
+                    if action == 'replay_data':
+                        return self.trajectory_stream.replay()
+                    return self.trajectory_stream.clear()
+            if action in {'preview', 'replay'}:
+                speed = number(args, 'speed_deg_s', 1, .5, 2)
+                speed_pct = number(args, 'speed_pct', 3, 1, 5, integer=True)
+                execute = args.get('execute', False)
+                if execute:
+                    self.motion_allowed(args)
+                    confirm(args, 'take_control')
+                with self.operation(name, action):
+                    driver = self.connected()
+                    state = self.read_state(monitor=True)
+                    if not math.isfinite(state.feedback_time) or abs(time.time() - state.feedback_time) > .5:
+                        raise RuntimeError('六轴反馈超过 0.5 秒未更新，拒绝预览或执行')
+                    with self.trajectory_stream.lock:
+                        if self.trajectory_stream.phase != 'recorded':
+                            raise RuntimeError('请先结束录制或数据回放；实体回放只使用完整轨迹')
+                        samples = list(self.trajectory_stream.samples)
+                    plan, points, digest = self._trajectory_plan(driver, state, samples, speed, speed_pct)
+                    key = f'trajectory-replay:{digest}:{speed}:{speed_pct}'
+                    if not execute:
+                        return {**plan, 'executed': False, **self.previews.put(key, state, digest)}
+                    self.previews.consume(args.get('preview_id') or None, key, state, digest)
+                    with self.trajectory_stream.lock:
+                        if self.trajectory_stream.phase != 'recorded':
+                            raise RuntimeError('轨迹状态已变化，请重新预览')
+                        self.trajectory_stream.phase = 'replaying_arm'
+                    try:
+                        result = driver.replay_joint_trajectory(points, speed, speed_pct)
+                        return {'executed': True, 'sample_count': len(points), **result}
+                    finally:
+                        with self.trajectory_stream.lock:
+                            self.trajectory_stream.phase = 'recorded'
+            raise ValueError(f'Unknown trajectory action: {action}')
         if action == 'start':
             self.start(name)
             return {'state': 'ready', 'message': f'「{TITLES[name]}」已就绪；未使能或移动'}
@@ -205,7 +294,7 @@ class PiperPlugin(PiperRuntime):
                     'message': '已确认失能；相应电机保持力已释放'}
 
     def halt(self, target):
-        affected_cards = {'piper_joint', 'piper_enable', 'piper_disable', 'piper_standby', 'piper_can'}
+        affected_cards = {'piper_joint', 'piper_enable', 'piper_disable', 'piper_standby', 'piper_can', 'piper_trajectory'}
         if target == 'gripper':
             affected_cards = {'piper_gripper'}
         elif target == 'all':
@@ -225,6 +314,42 @@ class PiperPlugin(PiperRuntime):
                 'active_card': active, 'motor_torque_released': False,
                 'message': '已请求取消并尽力保持；请读取反馈和完成结果' if affected else '本驱动当前没有所选范围内的动作',
                 'next_step': '需要释放保持力时，到「电机失能」并确认支撑'}
+
+    @staticmethod
+    def _trajectory_plan(driver, state, samples, speed_deg_s, speed_pct):
+        ready_to_move(state)
+        if len(samples) < 2:
+            raise RuntimeError('轨迹至少需要两个反馈点')
+        points = []
+        previous_ms = None
+        for sample in samples:
+            values = sample.get('joints_deg')
+            stamp = sample.get('timestamp_ms')
+            if (not isinstance(values, (list, tuple)) or len(values) != 6
+                    or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+                           for v in values)
+                    or isinstance(stamp, bool) or not isinstance(stamp, int)):
+                raise RuntimeError('轨迹包含无效反馈，拒绝回放')
+            if previous_ms is not None and not 0 < stamp-previous_ms <= 1000:
+                raise RuntimeError('轨迹反馈存在倒序或超过 1 秒的间断，请重新录制')
+            raw = tuple(round(v * 1000) for v in values)
+            if raw != driver._bounded_target(raw):
+                raise RuntimeError('轨迹中有点超出 SDK 或部署限位，拒绝回放')
+            points.append(tuple(v / 1000 for v in raw))
+            previous_ms = stamp
+        if any(abs(a-b) > .5 for a, b in zip(state.joints_deg, points[0])):
+            raise RuntimeError('当前位置与录制起点相差超过 0.5°；不会自动移动到起点')
+        duration = sum(max(abs(b-a) for a, b in zip(left, right)) / speed_deg_s
+                       for left, right in zip(points, points[1:]))
+        if duration > 180:
+            raise RuntimeError('按当前低速设置预计回放超过 180 秒；请缩短录制轨迹')
+        canonical = json.dumps(samples, sort_keys=True, separators=(',', ':'), allow_nan=False)
+        digest = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+        return ({'sample_count': len(points), 'duration_seconds': round(duration, 1),
+                 'speed_deg_s': speed_deg_s, 'speed_pct': speed_pct,
+                 'start_deg': points[0], 'end_deg': points[-1],
+                 'reminder': '实体回放会驱动机械臂；预览不移动，执行前须确认现场空间与控制权。'},
+                points, digest)
 
 
 def build_plugins(config, namespace, ros2):

@@ -487,6 +487,73 @@ class PiperDriver:
             self._hold_on_error(speed_pct)
             raise
 
+    def replay_joint_trajectory(self, points, speed_deg_s=1., speed_pct=3):
+        """Replay a prevalidated joint path with bounded, feedback-checked setpoints."""
+        from agilex.piper.control import ready_to_move
+        if not .5 <= speed_deg_s <= 2 or type(speed_pct) is not int or not 1 <= speed_pct <= 5:
+            raise ValueError("轨迹回放速度须不高于 2°/秒和 5%")
+        if len(points) < 2:
+            raise ValueError("至少需要两个轨迹点")
+        initial_raw, initial_state = self._healthy()
+        ready_to_move(initial_state)
+        if not all(initial_state.enabled):
+            raise RuntimeError("轨迹回放要求六轴已使能；卡片不会自动使能")
+        if not initial_state.control_mode.startswith("CAN_CTRL"):
+            raise RuntimeError("轨迹回放仅支持 CAN 控制模式")
+        start = tuple(round(v * 1000) for v in points[0])
+        if any(abs(a-b) > 500 for a, b in zip(initial_raw, start)):
+            raise RuntimeError("当前位置与录制起点相差超过 0.5°；拒绝跳到轨迹起点")
+
+        elapsed_total = sum(max(abs(b-a) for a, b in zip(left, right)) / speed_deg_s
+                            for left, right in zip(points, points[1:]))
+        if elapsed_total > 180:
+            raise RuntimeError("按当前低速设置预计回放超过 180 秒；请缩短录制轨迹")
+        started = time.monotonic()
+        deadline = started + max(10., elapsed_total * 3 + 5.)
+        commanded = initial_raw
+        try:
+            for left_deg, right_deg in zip(points, points[1:]):
+                left = tuple(round(v * 1000) for v in left_deg)
+                right = tuple(round(v * 1000) for v in right_deg)
+                duration = max(abs(b-a) for a, b in zip(left, right)) / (speed_deg_s * 1000)
+                segment_start = time.monotonic()
+                segment_elapsed = 0.
+                last = segment_start
+                while segment_elapsed < duration:
+                    self._check_cancelled()
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("轨迹回放超时，已请求保持当前姿态")
+                    actual, state = self._healthy()
+                    ready_to_move(state)
+                    if not all(state.enabled) or not state.control_mode.startswith("CAN_CTRL"):
+                        raise RuntimeError("使能或 CAN 控制状态变化，轨迹回放已取消")
+                    if any(abs(a-c) > 3000 for a, c in zip(actual, commanded)):
+                        raise RuntimeError("关节跟随偏差超过 3°，轨迹回放已取消")
+                    now = time.monotonic()
+                    segment_elapsed += min(.05, max(0., now-last))
+                    last = now
+                    u = min(1., segment_elapsed / duration) if duration else 1.
+                    commanded = tuple(round(a+(b-a)*u) for a, b in zip(left, right))
+                    self._command(commanded, speed_pct, expected_enabled=(True,) * 6)
+                    time.sleep(.05)
+                commanded = right
+            settle_deadline = min(deadline, time.monotonic() + 3)
+            while time.monotonic() < settle_deadline:
+                self._check_cancelled()
+                actual, state = self._healthy()
+                ready_to_move(state)
+                if not all(state.enabled) or not state.control_mode.startswith("CAN_CTRL"):
+                    raise RuntimeError("结束确认时使能或 CAN 控制状态变化")
+                if all(abs(a-b) <= 500 for a, b in zip(actual, commanded)):
+                    return {"confirmed": True, "state": asdict(state),
+                            "elapsed_seconds": round(time.monotonic()-started, 2)}
+                self._command(commanded, speed_pct, expected_enabled=(True,) * 6)
+                time.sleep(.05)
+            raise RuntimeError("未能确认轨迹终点在 ±0.5° 内")
+        except BaseException:
+            self._hold_on_error(speed_pct)
+            raise
+
     def stationary(self):
         first = self.get_state()
         deadline = time.monotonic() + .5
